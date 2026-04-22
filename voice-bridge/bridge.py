@@ -123,6 +123,9 @@ def call_hermes_chat(text: str, session_id: Optional[str]) -> tuple[str, Optiona
     session via `--resume <id>`, giving Hermes full memory + tool access.
     """
     hermes = find_hermes_bin()
+    # No explicit --max-turns cap: rely on the 180s subprocess timeout to
+    # prevent runaway loops instead. This avoids the "max iterations (N)"
+    # warnings on complex tool-using queries.
     cmd = [hermes, "chat", "-Q", "-q", text]
     if session_id:
         cmd += ["--resume", session_id]

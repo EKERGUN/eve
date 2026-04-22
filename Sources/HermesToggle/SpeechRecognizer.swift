@@ -2,12 +2,41 @@ import Foundation
 import AVFoundation
 import Speech
 
+/// Simple file logger at ~/Library/Logs/HermesToggle/swift.log — NSLog is
+/// unreliable for ad-hoc signed apps, so we append to a file we control.
+enum FileLog {
+    private static let url: URL = {
+        let u = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/HermesToggle", isDirectory: true)
+        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+        return u.appendingPathComponent("swift.log")
+    }()
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+    static func log(_ msg: String) {
+        let line = "\(fmt.string(from: Date())) \(msg)\n"
+        NSLog("%@", msg)
+        guard let data = line.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            try? h.seekToEnd()
+            try? h.write(contentsOf: data)
+            try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 // User-editable config at ~/Library/Application Support/EVE/config.json.
 // Missing file or any parse failure falls back to defaults.
 struct EVEConfig: Codable {
     var wake_words: [String]?
     var stop_phrases: [String]?
-    var locale: String?
+    var locale: String?          // command recognizer (used to transcribe post-wake text)
+    var wake_locale: String?     // wake recognizer (runs in parallel, catches the wake word)
     var silence_finalize_seconds: Double?
 
     static let defaultWakeWords = ["eve", "eva", "evie", "evy", "hey eve", "hey eva"]
@@ -24,7 +53,7 @@ struct EVEConfig: Codable {
               let cfg = try? JSONDecoder().decode(EVEConfig.self, from: data) else {
             return EVEConfig()
         }
-        NSLog("[speech] loaded config: \(url.path)")
+        FileLog.log("[speech] loaded config: \(url.path)")
         return cfg
     }
 }
@@ -32,9 +61,17 @@ struct EVEConfig: Codable {
 @MainActor
 final class SpeechRecognizer: ObservableObject {
     @Published var currentText: String = ""
+    @Published var displayText: String = ""   // current utterance only (past processedLength)
     @Published var isRunning: Bool = false
     @Published var level: Double = 0.0
     @Published var lastError: String? = nil
+    @Published var conversationActive: Bool = false
+    /// When true, wake detection is skipped. Set while EVE is speaking so her
+    /// own voice echoing into the mic can't self-trigger a wake event.
+    var suppressWake: Bool = false
+
+    private var lastInteractionAt: Date = .distantPast
+    private let conversationIdleTimeout: TimeInterval = 120  // 2 minutes
 
     private let config: EVEConfig
     private let wakeWords: [String]
@@ -45,14 +82,23 @@ final class SpeechRecognizer: ObservableObject {
     var onWake: (() -> Void)?            // fired the moment "Eve" is heard (for barge-in)
 
     private let engine = AVAudioEngine()
-    private let recognizer: SFSpeechRecognizer?
+    private let recognizer: SFSpeechRecognizer?          // command locale
+    private let wakeRecognizer: SFSpeechRecognizer?      // wake locale (may be same as above)
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var wakeRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var wakeTask: SFSpeechRecognitionTask?
+    private var wakeLastText: String = ""
 
     // Wake-word state
     private var awaitingCommandAfterWake = false
     private var wakeCutoffIndex: String.Index? = nil
     private var lastFinalizedText: String = ""
+    /// How many characters of the recognizer's cumulative transcript we've
+    /// already analysed for wake words. Bumped to `currentText.count` after
+    /// each command is sent so we don't re-trigger on old text when the task
+    /// stays alive across turns.
+    private var processedLength: Int = 0
     // Debounce re-triggering: ignore wake word if we just handled one.
     private var lastWakeAt: Date = .distantPast
     private var lastPartialUpdate: Date = .distantPast
@@ -69,30 +115,39 @@ final class SpeechRecognizer: ObservableObject {
         self.silenceFinalizeSeconds = cfg.silence_finalize_seconds ?? 1.2
         let locale = cfg.locale ?? "en-US"
         self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale))
-        NSLog("[speech] wake_words=\(wakeWords) locale=\(locale) finalize=\(silenceFinalizeSeconds)s")
+        // Wake recognizer defaults to the command locale. Set `wake_locale` in
+        // config.json to something different (e.g. "tr-TR") when your accent
+        // causes the command locale to mis-hear the wake word.
+        let wakeLoc = cfg.wake_locale ?? locale
+        if wakeLoc == locale {
+            self.wakeRecognizer = nil  // reuse single recognizer
+        } else {
+            self.wakeRecognizer = SFSpeechRecognizer(locale: Locale(identifier: wakeLoc))
+        }
+        FileLog.log("[speech] wake_words=\(wakeWords) locale=\(locale) wake_locale=\(wakeLoc) finalize=\(silenceFinalizeSeconds)s")
     }
 
     func start() {
         guard !isRunning else { return }
         lastError = nil
-        NSLog("[speech] start requested (auth status=\(SFSpeechRecognizer.authorizationStatus().rawValue))")
+        FileLog.log("[speech] start requested (auth status=\(SFSpeechRecognizer.authorizationStatus().rawValue))")
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             Task { @MainActor in
                 guard let self else { return }
-                NSLog("[speech] auth callback: \(status.rawValue)")
+                FileLog.log("[speech] auth callback: \(status.rawValue)")
                 switch status {
                 case .authorized:
                     do {
                         try self.beginSession()
-                        NSLog("[speech] session started OK, recognizer available=\(self.recognizer?.isAvailable ?? false)")
+                        FileLog.log("[speech] session started OK, recognizer available=\(self.recognizer?.isAvailable ?? false)")
                     }
                     catch {
                         self.lastError = "speech start: \(error.localizedDescription)"
-                        NSLog("[speech] beginSession FAILED: \(error.localizedDescription)")
+                        FileLog.log("[speech] beginSession FAILED: \(error.localizedDescription)")
                     }
                 case .denied, .restricted, .notDetermined:
                     self.lastError = "Speech recognition not authorized (status=\(status.rawValue))"
-                    NSLog("[speech] AUTH DENIED")
+                    FileLog.log("[speech] AUTH DENIED")
                 @unknown default:
                     self.lastError = "Speech recognition unknown auth state"
                 }
@@ -102,17 +157,24 @@ final class SpeechRecognizer: ObservableObject {
 
     func stop() {
         isRunning = false
+        conversationActive = false
         finalizeTimer?.invalidate()
         finalizeTimer = nil
         task?.cancel()
         task = nil
         request?.endAudio()
         request = nil
+        wakeTask?.cancel()
+        wakeTask = nil
+        wakeRequest?.endAudio()
+        wakeRequest = nil
+        wakeLastText = ""
         if engine.isRunning {
             engine.stop()
         }
         engine.inputNode.removeTap(onBus: 0)
         currentText = ""
+        displayText = ""
         level = 0.0
     }
 
@@ -124,6 +186,13 @@ final class SpeechRecognizer: ObservableObject {
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
+        req.taskHint = .dictation
+        // Bias recognition toward the wake words so Apple's LM prefers them
+        // over common homophones ("If", "You", "Evan", etc.).
+        req.contextualStrings = wakeWords + [
+            "Eve", "Eve,", "Hey Eve", "Eve stop", "Eve what",
+            "Eve please", "Eve open", "Eve tell me",
+        ]
         if #available(macOS 13, *) {
             if recognizer.supportsOnDeviceRecognition {
                 req.requiresOnDeviceRecognition = true
@@ -131,11 +200,36 @@ final class SpeechRecognizer: ObservableObject {
         }
         self.request = req
 
+        // If a separate wake recognizer is configured, start its own request.
+        if let wakeRec = wakeRecognizer, wakeRec.isAvailable {
+            let wReq = SFSpeechAudioBufferRecognitionRequest()
+            wReq.shouldReportPartialResults = true
+            if #available(macOS 13, *), wakeRec.supportsOnDeviceRecognition {
+                wReq.requiresOnDeviceRecognition = true
+            }
+            self.wakeRequest = wReq
+            self.wakeTask = wakeRec.recognitionTask(with: wReq) { [weak self] result, error in
+                guard let self else { return }
+                if let result = result {
+                    Task { @MainActor in self.handleWakeResult(result) }
+                }
+                if error != nil {
+                    Task { @MainActor in self.restartWakeAfterError() }
+                }
+            }
+            FileLog.log("[speech] wake recognizer started (\(wakeRec.locale.identifier))")
+        }
+
         let inputNode = engine.inputNode
+        // AEC via setVoiceProcessingEnabled requires a full audio graph
+        // including an output node, which this app doesn't set up — enabling
+        // it kills the input tap. Rely on `suppressWake` (set while Python
+        // reports state=speaking) to prevent self-wake from echo.
         let format = inputNode.outputFormat(forBus: 0)
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.request?.append(buffer)
+            self?.wakeRequest?.append(buffer)
             // Level meter for the orb
             if let ch = buffer.floatChannelData?[0] {
                 let n = Int(buffer.frameLength)
@@ -187,15 +281,100 @@ final class SpeechRecognizer: ObservableObject {
         }
     }
 
+    private func handleWakeResult(_ result: SFSpeechRecognitionResult) {
+        let full = result.bestTranscription.formattedString
+        FileLog.log("[speech] WAKE partial: \(full.prefix(120))")
+        if suppressWake {
+            wakeLastText = full
+            return
+        }
+        let lower = full.lowercased()
+        // Only look at the tail (everything past what we already processed).
+        if let _ = findWake(in: lower, after: wakeLastText.lowercased().count) {
+            let now = Date()
+            if now.timeIntervalSince(lastWakeAt) > 0.6 {
+                lastWakeAt = now
+                FileLog.log("[speech] WAKE DETECTED from wake recognizer")
+                onWake?()
+            }
+            awaitingCommandAfterWake = true
+            // Mark where the command recognizer's cursor should start cutting.
+            // We cannot map wake-recognizer offset → command-recognizer offset
+            // directly (different tokenizations), so we mark "everything from
+            // NOW onwards on the command stream is the command".
+            wakeCutoffIndex = currentText.endIndex
+        }
+        wakeLastText = full
+        // Each wake result counts as an audio update — reset the finalize timer.
+        lastPartialUpdate = Date()
+        scheduleFinalize()
+    }
+
+    private func restartWakeAfterError() {
+        guard isRunning, let wakeRec = wakeRecognizer else { return }
+        wakeTask?.cancel()
+        wakeTask = nil
+        wakeRequest?.endAudio()
+        wakeRequest = nil
+        wakeLastText = ""
+        let wReq = SFSpeechAudioBufferRecognitionRequest()
+        wReq.shouldReportPartialResults = true
+        if #available(macOS 13, *), wakeRec.supportsOnDeviceRecognition {
+            wReq.requiresOnDeviceRecognition = true
+        }
+        self.wakeRequest = wReq
+        self.wakeTask = wakeRec.recognitionTask(with: wReq) { [weak self] result, error in
+            guard let self else { return }
+            if let result = result {
+                Task { @MainActor in self.handleWakeResult(result) }
+            }
+            if error != nil {
+                Task { @MainActor in self.restartWakeAfterError() }
+            }
+        }
+    }
+
     private func handleResult(_ result: SFSpeechRecognitionResult) {
         let full = result.bestTranscription.formattedString
-        NSLog("[speech] partial: \(full.prefix(120)) final=\(result.isFinal)")
+        FileLog.log("[speech] partial: \(String(full.suffix(120))) final=\(result.isFinal)")
+
+        // Detect Apple resetting its partial buffer (occurs after long silence
+        // or when the recognizer segments a new utterance). If the new `full`
+        // is shorter than our cursor OR no longer starts with our last
+        // finalized prefix, the cursor is stale — reset it.
+        let lowerFull = full.lowercased()
+        let lowerLast = lastFinalizedText.lowercased()
+        if full.count < processedLength || !lowerFull.hasPrefix(lowerLast) {
+            FileLog.log("[speech] transcript reset (len was \(processedLength), now \(full.count)) — clearing cursor")
+            processedLength = 0
+            lastFinalizedText = ""
+            awaitingCommandAfterWake = false
+            wakeCutoffIndex = nil
+        }
+
         currentText = full
+        displayText = processedLength < full.count
+            ? String(full.dropFirst(processedLength))
+            : ""
         lastPartialUpdate = Date()
 
-        // Detect wake word in the *newly* spoken portion.
+        // If we already detected wake via the wake recognizer, keep the
+        // cursor at the start of this stream (everything will be the command).
+        if awaitingCommandAfterWake && wakeCutoffIndex == nil {
+            wakeCutoffIndex = full.startIndex
+        }
+
+        // Wake detection only looks at the NEW portion of the transcript
+        // (past processedLength) so old commands never retrigger wake.
         let lower = full.lowercased()
-        if let wakeRange = findWake(in: lower, after: lastFinalizedText.lowercased().count) {
+        if suppressWake {
+            // EVE is speaking — ignore any wake detection; the transcript is
+            // probably echo of her own voice. But still keep the cursor
+            // advancing so when she stops, we don't process her speech.
+            processedLength = full.count
+            return
+        }
+        if let wakeRange = findWake(in: lower, after: max(processedLength, lastFinalizedText.lowercased().count)) {
             // Fire wake event immediately (barge-in).
             let now = Date()
             if now.timeIntervalSince(lastWakeAt) > 0.6 {
@@ -232,36 +411,84 @@ final class SpeechRecognizer: ObservableObject {
         finalizeTimer?.invalidate()
         finalizeTimer = nil
         let full = currentText
-        if awaitingCommandAfterWake, let cut = wakeCutoffIndex,
-           cut <= full.endIndex {
-            let command = String(full[cut...])
+
+        // Expire conversation after long idle.
+        if conversationActive && Date().timeIntervalSince(lastInteractionAt) > conversationIdleTimeout {
+            FileLog.log("[speech] conversation timed out after \(Int(conversationIdleTimeout))s idle — requiring wake word again")
+            conversationActive = false
+        }
+
+        // Decide which part of the transcript is the command.
+        var command: String? = nil
+        if awaitingCommandAfterWake {
+            // Find the LAST wake match in the *current* full text and take
+            // everything after it. Apple's recognizer occasionally re-writes
+            // partials without changing length, so a stored index can go
+            // stale; rescanning at finalize avoids losing command words.
+            let lower = full.lowercased()
+            if let endOffset = findLastWakeEnd(in: lower) {
+                let idx = full.index(full.startIndex, offsetBy: endOffset)
+                command = String(full[idx...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
+            } else if let cut = wakeCutoffIndex, cut <= full.endIndex {
+                // Rescan didn't find the wake (rare) — fall back to stored index.
+                command = String(full[cut...])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
+            }
+        } else if conversationActive {
+            // No wake required while conversation is active — take everything
+            // past the cursor as the command.
+            let tail = String(full.dropFirst(processedLength))
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
-            if !command.isEmpty {
-                if isStopPhrase(command) {
-                    // "Eve stop" / "Eve be quiet" / "Eve sus" → go idle,
-                    // don't bother Hermes. Any in-flight TTS was already
-                    // killed by the onWake interrupt.
-                    NSLog("[voice] stop phrase: \(command) — going idle")
-                } else {
-                    onCommand?(command)
-                }
+            if !tail.isEmpty { command = tail }
+        }
+
+        if let c = command, !c.isEmpty {
+            if isStopPhrase(c) {
+                FileLog.log("[speech] stop phrase: \(c) — exiting conversation")
+                conversationActive = false
+            } else {
+                FileLog.log("[speech] FIRE command: \(c.prefix(80)) (conversationActive=\(conversationActive))")
+                conversationActive = true     // entering / staying in conversation
+                lastInteractionAt = Date()
+                onCommand?(c)
             }
         }
-        // Reset for the next utterance.
+
+        processedLength = full.count
         awaitingCommandAfterWake = false
         wakeCutoffIndex = nil
-        lastFinalizedText = ""
-        currentText = ""
-        // Tear down + rebuild the request so SFSpeechRecognizer starts a new
-        // segment (old one accumulates too much context and eventually
-        // hits duration limits or rejects input).
-        startNewRequest()
+        lastFinalizedText = full
+        wakeLastText = full
+        displayText = ""
     }
 
     func isStopPhrase(_ text: String) -> Bool {
-        let t = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,"))
-        return stopPhraseSet.contains(t)
+        let cleaned = text.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
+        if stopPhraseSet.contains(cleaned) { return true }
+
+        // Split into words. If every word (after dedup) forms a stop phrase,
+        // treat the whole utterance as "stop". Catches "stop stop", "stop now",
+        // "be quiet be quiet", etc.
+        let words = cleaned
+            .split(whereSeparator: { !$0.isLetter })
+            .map { String($0) }
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return false }
+
+        // De-dupe adjacent repeats: "stop stop stop" -> "stop"
+        var compact: [String] = []
+        for w in words where compact.last != w { compact.append(w) }
+        let collapsed = compact.joined(separator: " ")
+        if stopPhraseSet.contains(collapsed) { return true }
+
+        // Also accept if EVERY distinct word is a single-word stop token.
+        let singleWordStops = Set(stopPhraseSet.filter { !$0.contains(" ") })
+        if Set(words).isSubset(of: singleWordStops) { return true }
+
+        return false
     }
 
     private func startNewRequest() {
@@ -272,6 +499,13 @@ final class SpeechRecognizer: ObservableObject {
         request?.endAudio()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
+        req.taskHint = .dictation
+        // Bias recognition toward the wake words so Apple's LM prefers them
+        // over common homophones ("If", "You", "Evan", etc.).
+        req.contextualStrings = wakeWords + [
+            "Eve", "Eve,", "Hey Eve", "Eve stop", "Eve what",
+            "Eve please", "Eve open", "Eve tell me",
+        ]
         if #available(macOS 13, *) {
             if recognizer.supportsOnDeviceRecognition {
                 req.requiresOnDeviceRecognition = true
@@ -287,6 +521,31 @@ final class SpeechRecognizer: ObservableObject {
                 Task { @MainActor in self.restartAfterError() }
             }
         }
+    }
+
+    /// Scan the ENTIRE string for the LAST occurrence of any wake word and
+    /// return the offset just past its end. Used on finalize to locate the
+    /// command boundary fresh (avoids stale indices when Apple re-transcribes
+    /// partials).
+    func findLastWakeEnd(in lower: String) -> Int? {
+        let sorted = wakeWords.sorted { $0.count > $1.count }
+        var best: Int? = nil
+        var bestStart: Int = -1
+        for v in sorted {
+            let escaped = NSRegularExpression.escapedPattern(for: v)
+            let regex = try? NSRegularExpression(pattern: "\\b\(escaped)\\b",
+                                                 options: .caseInsensitive)
+            guard let rx = regex else { continue }
+            let ns = lower as NSString
+            let matches = rx.matches(in: lower, range: NSRange(location: 0, length: ns.length))
+            for m in matches {
+                if m.range.location > bestStart {
+                    bestStart = m.range.location
+                    best = m.range.location + m.range.length
+                }
+            }
+        }
+        return best
     }
 
     // Wake-word matcher. Uses the per-instance `wakeWords` list (config-driven).

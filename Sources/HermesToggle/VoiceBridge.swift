@@ -16,6 +16,7 @@ final class VoiceBridge: ObservableObject {
     @Published var lastTranscript: String? = nil
     @Published var lastReply: String? = nil
     @Published var errorMessage: String? = nil
+    @Published var conversationActive: Bool = false
 
     private var bridgeProcess: Process?
     private var ws: URLSessionWebSocketTask?
@@ -29,9 +30,13 @@ final class VoiceBridge: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] newLevel in self?.level = newLevel }
             .store(in: &cancellables)
-        speech.$currentText
+        speech.$displayText
             .receive(on: RunLoop.main)
             .sink { [weak self] t in self?.liveText = t }
+            .store(in: &cancellables)
+        speech.$conversationActive
+            .receive(on: RunLoop.main)
+            .sink { [weak self] b in self?.conversationActive = b }
             .store(in: &cancellables)
     }
 
@@ -226,6 +231,9 @@ final class VoiceBridge: ObservableObject {
             case "state":
                 if let v = obj["value"] as? String, let st = VoiceState(rawValue: v) {
                     self.state = st
+                    // Suppress wake detection while EVE is speaking so her
+                    // own voice bleeding into the mic can't self-trigger.
+                    self.speech.suppressWake = (st == .speaking || st == .thinking)
                 }
             case "transcript":
                 if let t = obj["text"] as? String { self.lastTranscript = t }

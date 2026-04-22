@@ -144,7 +144,11 @@ struct ToggleView: View {
                     .fill(voice.isOn ? Color.green : Color.white.opacity(0.25))
                     .frame(width: 7, height: 7)
                     .shadow(color: voice.isOn ? .green : .clear, radius: 4)
-                Text(voice.isOn ? voice.state.rawValue.uppercased() : "TAP ORB TO TALK")
+                Text(voice.isOn
+                     ? (voice.conversationActive
+                        ? "\(voice.state.rawValue.uppercased()) · CHAT"
+                        : voice.state.rawValue.uppercased())
+                     : "TAP ORB TO TALK")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .tracking(3)
                     .foregroundStyle(.white.opacity(0.7))
