@@ -70,12 +70,37 @@ and supports Turkish + English out of the box.
 
 - macOS 13 (Ventura) or newer — on-device recognition requires modern macOS.
 - Apple Silicon or Intel Mac. Tested on M4 Mac mini, 16 GB.
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed
-  (`~/.local/bin/hermes` or `/usr/local/bin/hermes`) with a working provider
-  config (`hermes model`, `hermes login`).
 - Xcode command-line tools (`xcode-select --install`).
-- ffmpeg + afplay (afplay is built-in; `brew install ffmpeg`).
-- Edge TTS bundled with Hermes (`tts.provider: edge` in `~/.hermes/config.yaml`).
+- `ffmpeg` (`brew install ffmpeg`).
+
+### Hermes Agent (the brain)
+
+EVE is only a voice front-end. The agentic work — answering, using skills,
+browsing, reading Telegram, etc. — happens inside Hermes Agent, which you
+install and configure yourself:
+
+```bash
+# 1. Install Hermes
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+source ~/.zshrc
+
+# 2. Run the setup wizard — pick a provider, log in, write config.yaml.
+hermes setup
+# or manually:
+hermes model          # pick provider + model
+hermes login <provider>
+
+# 3. Make TTS work locally for free (Microsoft Edge neural voices, no key).
+hermes config set tts.provider edge
+
+# 4. Sanity check
+hermes chat -Q -q "Say ok and nothing else."
+```
+
+**EVE never touches your API keys.** It shells out to your local `hermes`
+binary, which reads `~/.hermes/.env` and `~/.hermes/config.yaml`. Whatever
+provider and credentials you set up for Hermes become the provider EVE
+speaks to. Your `~/.hermes/` directory stays entirely on your machine.
 
 ## Build
 
@@ -106,17 +131,57 @@ grant both.
 
 ## Configuration
 
-Environment variables (set before launching `EVE.app`, or bake into a
-LaunchAgent):
+### Changing the wake word (no rebuild required)
+
+EVE creates `~/Library/Application Support/EVE/config.json` on first launch:
+
+```json
+{
+  "wake_words": ["eve", "eva", "evie", "hey eve"],
+  "stop_phrases": [
+    "stop", "stop it", "be quiet", "shut up", "enough",
+    "dur", "sus", "yeter"
+  ],
+  "locale": "en-US",
+  "silence_finalize_seconds": 1.2
+}
+```
+
+Edit it, then quit + relaunch `EVE.app`. For example, to use **"Jarvis"**:
+
+```bash
+cat > ~/Library/Application\ Support/EVE/config.json <<'JSON'
+{
+  "wake_words": ["jarvis", "jarvis?", "hey jarvis"],
+  "locale": "en-US"
+}
+JSON
+osascript -e 'tell application "EVE" to quit' && sleep 1 && open /Applications/EVE.app
+```
+
+- `wake_words` — list, case-insensitive, matched on word boundaries. Longer
+  variants checked first (so "hey eve" beats "eve").
+- `stop_phrases` — everything in here, when heard right after the wake word,
+  silences EVE without hitting Hermes.
+- `locale` — any `SFSpeechRecognizer` locale id. `tr-TR` for Turkish-only,
+  `en-US` for English, `de-DE` for German, etc. Mixed-language usage works
+  best with `en-US` because Apple's English model tolerates accents decently;
+  set to `tr-TR` only if you speak almost entirely Turkish.
+- `silence_finalize_seconds` — seconds of silence after wake that triggers
+  "finalize + send to Hermes". Lower = snappier, higher = more tolerant of
+  pauses mid-sentence.
+
+### Environment variables (optional)
+
+Set before launching `EVE.app`, or bake into a LaunchAgent:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HERMES_VOICE_TIMEOUT` | `180` | Max seconds to wait for `hermes chat` reply |
 | `HERMES_TR_VOICE` | `tr-TR-EmelNeural` | Edge TTS voice for Turkish replies |
-| `HERMES_WAKE_WORD` | `eve` | (Python side only — Swift matches `eve`/`eva`/`evie`/`hey eve`) |
 
-TTS provider, STT locale, etc. are read from `~/.hermes/config.yaml`. Only
-voice-specific behavior lives in the bridge.
+Everything else (TTS provider, STT providers for the fallback path, model,
+keys) lives in `~/.hermes/config.yaml` — managed by the Hermes CLI, not by EVE.
 
 ## Project layout
 

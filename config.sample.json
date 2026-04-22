@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to ~/Library/Application Support/EVE/config.json and restart EVE.",
+  "wake_words": ["eve", "eva", "evie", "hey eve"],
+  "stop_phrases": [
+    "stop", "stop it", "be quiet", "shut up", "enough",
+    "dur", "sus", "yeter"
+  ],
+  "locale": "en-US",
+  "silence_finalize_seconds": 1.2
+}

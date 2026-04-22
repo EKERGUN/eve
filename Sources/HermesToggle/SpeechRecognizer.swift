@@ -2,12 +2,43 @@ import Foundation
 import AVFoundation
 import Speech
 
+// User-editable config at ~/Library/Application Support/EVE/config.json.
+// Missing file or any parse failure falls back to defaults.
+struct EVEConfig: Codable {
+    var wake_words: [String]?
+    var stop_phrases: [String]?
+    var locale: String?
+    var silence_finalize_seconds: Double?
+
+    static let defaultWakeWords = ["eve", "eva", "evie", "evy", "hey eve", "hey eva"]
+    static let defaultStopPhrases = [
+        "stop", "stop it", "stop talking", "be quiet", "quiet", "shut up",
+        "silence", "shush", "hush", "enough", "that's enough",
+        "dur", "sus", "kes", "kes sesini", "sessiz ol", "yeter", "tamam dur",
+    ]
+
+    static func load() -> EVEConfig {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/EVE/config.json")
+        guard let data = try? Data(contentsOf: url),
+              let cfg = try? JSONDecoder().decode(EVEConfig.self, from: data) else {
+            return EVEConfig()
+        }
+        NSLog("[speech] loaded config: \(url.path)")
+        return cfg
+    }
+}
+
 @MainActor
 final class SpeechRecognizer: ObservableObject {
     @Published var currentText: String = ""
     @Published var isRunning: Bool = false
     @Published var level: Double = 0.0
     @Published var lastError: String? = nil
+
+    private let config: EVEConfig
+    private let wakeWords: [String]
+    private let stopPhraseSet: Set<String>
 
     // Callbacks
     var onCommand: ((String) -> Void)?   // final command text (post-wake)
@@ -26,10 +57,19 @@ final class SpeechRecognizer: ObservableObject {
     private var lastWakeAt: Date = .distantPast
     private var lastPartialUpdate: Date = .distantPast
     private var finalizeTimer: Timer?
-    private let silenceFinalizeSeconds: TimeInterval = 1.2
+    private let silenceFinalizeSeconds: TimeInterval
 
-    init(localeIdentifier: String = "en-US") {
-        self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
+    init() {
+        let cfg = EVEConfig.load()
+        self.config = cfg
+        self.wakeWords = (cfg.wake_words?.isEmpty == false ? cfg.wake_words! : EVEConfig.defaultWakeWords)
+            .map { $0.lowercased() }
+        self.stopPhraseSet = Set((cfg.stop_phrases?.isEmpty == false ? cfg.stop_phrases! : EVEConfig.defaultStopPhrases)
+            .map { $0.lowercased() })
+        self.silenceFinalizeSeconds = cfg.silence_finalize_seconds ?? 1.2
+        let locale = cfg.locale ?? "en-US"
+        self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale))
+        NSLog("[speech] wake_words=\(wakeWords) locale=\(locale) finalize=\(silenceFinalizeSeconds)s")
     }
 
     func start() {
@@ -155,7 +195,7 @@ final class SpeechRecognizer: ObservableObject {
 
         // Detect wake word in the *newly* spoken portion.
         let lower = full.lowercased()
-        if let wakeRange = Self.findWake(in: lower, after: lastFinalizedText.lowercased().count) {
+        if let wakeRange = findWake(in: lower, after: lastFinalizedText.lowercased().count) {
             // Fire wake event immediately (barge-in).
             let now = Date()
             if now.timeIntervalSince(lastWakeAt) > 0.6 {
@@ -197,7 +237,7 @@ final class SpeechRecognizer: ObservableObject {
             let command = String(full[cut...])
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
             if !command.isEmpty {
-                if Self.isStopPhrase(command) {
+                if isStopPhrase(command) {
                     // "Eve stop" / "Eve be quiet" / "Eve sus" → go idle,
                     // don't bother Hermes. Any in-flight TTS was already
                     // killed by the onWake interrupt.
@@ -218,19 +258,10 @@ final class SpeechRecognizer: ObservableObject {
         startNewRequest()
     }
 
-    // Stop phrases (English + Turkish) — when heard right after "Eve", silence
-    // Hermes without sending anything to the agent. Keep small and specific
-    // to avoid accidentally swallowing real questions.
-    private static let _stopPhrases: Set<String> = [
-        "stop", "stop it", "stop talking", "be quiet", "quiet", "shut up",
-        "silence", "shush", "hush", "enough", "that's enough",
-        "dur", "sus", "kes", "kes sesini", "sessiz ol", "yeter", "tamam dur",
-    ]
-
-    static func isStopPhrase(_ text: String) -> Bool {
+    func isStopPhrase(_ text: String) -> Bool {
         let t = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,"))
-        return _stopPhrases.contains(t)
+        return stopPhraseSet.contains(t)
     }
 
     private func startNewRequest() {
@@ -258,13 +289,16 @@ final class SpeechRecognizer: ObservableObject {
         }
     }
 
-    // Wake-word matcher. Looks for "eve", "eva", "evie", "hey eve" etc. in lowercase string.
-    // Returns the NSRange (in string offsets) of the match, or nil.
-    static func findWake(in lower: String, after startOffset: Int) -> Range<Int>? {
-        let variants = ["hey eve", "hey eva", "eve", "eva", "evie", "evy"]
+    // Wake-word matcher. Uses the per-instance `wakeWords` list (config-driven).
+    // Returns the (start, end) offset range in `lower`, or nil. Longer variants
+    // checked first so "hey eve" beats "eve".
+    func findWake(in lower: String, after startOffset: Int) -> Range<Int>? {
+        let sorted = wakeWords.sorted { $0.count > $1.count }
         let search = String(lower.dropFirst(min(startOffset, lower.count)))
-        for v in variants {
-            if let r = search.range(of: "\\b\(v)\\b", options: [.regularExpression, .caseInsensitive]) {
+        for v in sorted {
+            let escaped = NSRegularExpression.escapedPattern(for: v)
+            if let r = search.range(of: "\\b\(escaped)\\b",
+                                    options: [.regularExpression, .caseInsensitive]) {
                 let offset = search.distance(from: search.startIndex, to: r.lowerBound) + startOffset
                 let end = search.distance(from: search.startIndex, to: r.upperBound) + startOffset
                 return offset..<end
