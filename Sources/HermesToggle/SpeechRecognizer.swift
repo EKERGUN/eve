@@ -66,9 +66,33 @@ final class SpeechRecognizer: ObservableObject {
     @Published var level: Double = 0.0
     @Published var lastError: String? = nil
     @Published var conversationActive: Bool = false
+    /// Fired when a stop phrase is heard (separate from `onCommand`) so the
+    /// bridge can also interrupt any TTS still in flight.
+    var onStop: (() -> Void)?
     /// When true, wake detection is skipped. Set while EVE is speaking so her
     /// own voice echoing into the mic can't self-trigger a wake event.
-    var suppressWake: Bool = false
+    /// On the falling edge we snap our cursor to the current transcript so
+    /// EVE's own echoed words never end up in a user command.
+    var suppressWake: Bool = false {
+        didSet {
+            guard oldValue != suppressWake else { return }
+            if oldValue && !suppressWake {
+                processedLength = currentText.count
+                lastFinalizedText = currentText
+                awaitingCommandAfterWake = false
+                wakeCutoffIndex = nil
+                wakeLastText = currentText
+                displayText = ""
+                // Apple's recognizer buffers 1-2s of audio internally, so
+                // echoed partials keep arriving briefly after EVE stops.
+                // Drain window: keep discarding partials for the next
+                // ~3s so they don't land as fake user commands.
+                drainUntil = Date().addingTimeInterval(3.0)
+                FileLog.log("[speech] suppress→listening: snap=\(processedLength), drain until \(drainUntil)")
+            }
+        }
+    }
+    private var drainUntil: Date = .distantPast
 
     private var lastInteractionAt: Date = .distantPast
     private let conversationIdleTimeout: TimeInterval = 120  // 2 minutes
@@ -367,11 +391,20 @@ final class SpeechRecognizer: ObservableObject {
         // Wake detection only looks at the NEW portion of the transcript
         // (past processedLength) so old commands never retrigger wake.
         let lower = full.lowercased()
-        if suppressWake {
-            // EVE is speaking — ignore any wake detection; the transcript is
-            // probably echo of her own voice. But still keep the cursor
-            // advancing so when she stops, we don't process her speech.
+        let inDrain = Date() < drainUntil
+        if suppressWake || inDrain {
+            // Either EVE is speaking, or we're in the post-speech drain
+            // window catching Apple's buffered echo partials. Scan for the
+            // emergency barge-in pattern ("<wake> <stop>") — a sequence
+            // that essentially never appears in Hermes's own reply text.
+            let newTail = String(full.dropFirst(processedLength))
+            if let _ = matchWakeThenStop(in: newTail) {
+                FileLog.log("[speech] barge-in STOP during \(suppressWake ? "suppression" : "drain"): \(newTail.suffix(80))")
+                conversationActive = false
+                onStop?()
+            }
             processedLength = full.count
+            lastFinalizedText = full
             return
         }
         if let wakeRange = findWake(in: lower, after: max(processedLength, lastFinalizedText.lowercased().count)) {
@@ -447,6 +480,7 @@ final class SpeechRecognizer: ObservableObject {
             if isStopPhrase(c) {
                 FileLog.log("[speech] stop phrase: \(c) — exiting conversation")
                 conversationActive = false
+                onStop?()
             } else {
                 FileLog.log("[speech] FIRE command: \(c.prefix(80)) (conversationActive=\(conversationActive))")
                 conversationActive = true     // entering / staying in conversation
@@ -521,6 +555,24 @@ final class SpeechRecognizer: ObservableObject {
                 Task { @MainActor in self.restartAfterError() }
             }
         }
+    }
+
+    /// Check if the input contains a wake word followed immediately (within a
+    /// few filler tokens) by a stop phrase — e.g. "eve stop", "eve be quiet",
+    /// "hey eve shut up". Used for barge-in during TTS playback.
+    func matchWakeThenStop(in text: String) -> Range<String.Index>? {
+        let lower = text.lowercased()
+        for wake in wakeWords.sorted(by: { $0.count > $1.count }) {
+            let wakeEsc = NSRegularExpression.escapedPattern(for: wake)
+            for stop in stopPhraseSet {
+                let stopEsc = NSRegularExpression.escapedPattern(for: stop)
+                let pattern = "\\b\(wakeEsc)\\b[,\\.!\\?\\s]*\\b\(stopEsc)\\b"
+                if let r = lower.range(of: pattern, options: [.regularExpression]) {
+                    return r
+                }
+            }
+        }
+        return nil
     }
 
     /// Scan the ENTIRE string for the LAST occurrence of any wake word and

@@ -79,6 +79,12 @@ final class VoiceBridge: ObservableObject {
             self.lastTranscript = command
             self.send(["cmd": "process", "text": command])
         }
+        speech.onStop = { [weak self] in
+            guard let self else { return }
+            NSLog("[voice] STOP phrase — interrupting TTS")
+            self.send(["cmd": "interrupt"])
+            self.state = .listening
+        }
         Task {
             do {
                 NSLog("[voice] turnOn: freeing port")

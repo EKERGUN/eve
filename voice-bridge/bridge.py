@@ -115,18 +115,31 @@ def save_voice_session_id(session_id: str) -> None:
         log.warning("failed to persist session id: %s", e)
 
 
+VOICE_STYLE_PREAMBLE = (
+    "[Voice mode. Reply in 1-3 short spoken sentences, no markdown, no lists, "
+    "no URLs, no code, no headings. Maximum 50 words.] "
+)
+
+
 def call_hermes_chat(text: str, session_id: Optional[str]) -> tuple[str, Optional[str]]:
     """Delegate to Hermes agent for the reply. Returns (reply_text, session_id).
 
     First turn: spawns `hermes chat -Q -q <text>` which creates a new session
     and prints `session_id: <id>\\n<reply>`. Subsequent turns resume the same
     session via `--resume <id>`, giving Hermes full memory + tool access.
+
+    The user text is prepended with a short voice-style instruction so
+    replies stay speakable — keeps EVE from reading out long URL-laden
+    paragraphs through the speakers.
     """
     hermes = find_hermes_bin()
     # No explicit --max-turns cap: rely on the 180s subprocess timeout to
     # prevent runaway loops instead. This avoids the "max iterations (N)"
     # warnings on complex tool-using queries.
-    cmd = [hermes, "chat", "-Q", "-q", text]
+    # --accept-hooks auto-approves shell-script hooks (terminal, web tools)
+    # since there's no TTY for an interactive prompt in voice mode.
+    cmd = [hermes, "chat", "-Q", "-q", VOICE_STYLE_PREAMBLE + text,
+           "--accept-hooks"]
     if session_id:
         cmd += ["--resume", session_id]
     log.info("hermes chat (resume=%s)", session_id or "-")
