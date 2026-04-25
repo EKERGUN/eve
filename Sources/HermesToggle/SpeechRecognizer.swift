@@ -131,6 +131,7 @@ final class SpeechRecognizer: ObservableObject {
     private var lastWakeAt: Date = .distantPast
     private var lastPartialUpdate: Date = .distantPast
     private var finalizeTimer: Timer?
+    private var idleCheckTimer: Timer?
     let silenceFinalizeSeconds: TimeInterval
 
     init() {
@@ -188,6 +189,8 @@ final class SpeechRecognizer: ObservableObject {
         conversationActive = false
         finalizeTimer?.invalidate()
         finalizeTimer = nil
+        idleCheckTimer?.invalidate()
+        idleCheckTimer = nil
         task?.cancel()
         task = nil
         request?.endAudio()
@@ -274,6 +277,7 @@ final class SpeechRecognizer: ObservableObject {
         engine.prepare()
         try engine.start()
         isRunning = true
+        startIdleCheckTimer()
 
         self.task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
@@ -289,6 +293,26 @@ final class SpeechRecognizer: ObservableObject {
                     self.restartAfterError()
                 }
             }
+        }
+    }
+
+    /// Background timer so a silent user doesn't stay in conversation mode
+    /// forever. Without this we only checked the idle deadline at finalize
+    /// time, but if no audio arrives there's no finalize and the wake-word
+    /// requirement never re-engages.
+    private func startIdleCheckTimer() {
+        idleCheckTimer?.invalidate()
+        idleCheckTimer = Timer.scheduledTimer(withTimeInterval: 30.0,
+                                              repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.checkIdleTimeout() }
+        }
+    }
+
+    private func checkIdleTimeout() {
+        guard conversationActive else { return }
+        if Date().timeIntervalSince(lastInteractionAt) > conversationIdleTimeout {
+            FileLog.log("[speech] conversation idle > \(Int(conversationIdleTimeout))s — requiring wake word again")
+            conversationActive = false
         }
     }
 

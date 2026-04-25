@@ -102,7 +102,7 @@ final class VoiceBridge: ObservableObject {
                 NSLog("[voice] turnOn: done")
             } catch {
                 self.errorMessage = "voice start failed: \(error.localizedDescription)"
-                killBridge()
+                await killBridge()
                 self.state = .idle
                 self.level = 0.0
                 self.isOn = false
@@ -118,7 +118,7 @@ final class VoiceBridge: ObservableObject {
         send(["cmd": "stop"])
         Task {
             try? await Task.sleep(nanoseconds: 400_000_000)
-            killBridge()
+            await killBridge()
             freePort()
             self.state = .idle
             self.level = 0.0
@@ -294,13 +294,18 @@ final class VoiceBridge: ObservableObject {
         }
     }
 
-    private func killBridge() {
+    private func killBridge() async {
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         if let p = bridgeProcess, p.isRunning {
             p.terminate()
+            // `Task.sleep` is a suspension point — the main actor can run
+            // other UI work while we wait, unlike the `Thread.sleep` poll
+            // this replaces. SIGKILL if the bridge hasn't exited in 2s.
             let deadline = Date().addingTimeInterval(2)
-            while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
+            while p.isRunning && Date() < deadline {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
             if p.isRunning { kill(p.processIdentifier, SIGKILL) }
         }
         bridgeProcess = nil

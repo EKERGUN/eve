@@ -74,6 +74,27 @@ def detect_wake(text: str) -> Optional[str]:
     post = text[m.end():].strip(" ,.!?;:")
     return post  # may be empty string (pure wake trigger, no command yet)
 
+def _ensure_hermes_agent_layout() -> None:
+    """Verify the configured Hermes Agent path exists and looks valid before
+    we splice it onto sys.path. A bad HERMES_HOME otherwise produces a
+    cryptic ModuleNotFoundError, and sys.path.insert on a non-existent or
+    user-writable directory is a code-injection footgun.
+    """
+    if not HERMES_AGENT.is_dir():
+        sys.stderr.write(
+            f"FATAL: hermes-agent not found at {HERMES_AGENT}\n"
+            f"Set HERMES_HOME to the directory containing hermes-agent/.\n"
+        )
+        sys.exit(2)
+    if not (HERMES_AGENT / "tools").is_dir():
+        sys.stderr.write(
+            f"FATAL: {HERMES_AGENT} is missing the tools/ subdirectory; "
+            f"this does not look like a hermes-agent install.\n"
+        )
+        sys.exit(2)
+
+
+_ensure_hermes_agent_layout()
 sys.path.insert(0, str(HERMES_AGENT))
 
 from tools import voice_mode  # noqa: E402
