@@ -181,13 +181,29 @@ class VoiceLoop:
         self._session_id = load_voice_session_id()
         # Track the current TTS/hermes background thread for barge-in.
         self._speak_thread: Optional[threading.Thread] = None
-        self._speak_generation = 0  # increments on each new reply request
+        # `_speak_generation` is bumped on each new request so in-flight
+        # workers can detect they've been superseded. The counter is read
+        # from worker threads while interrupt()/process() write it from the
+        # WS handler thread, so all access goes through `_gen_lock`.
+        # A Python `int +=` is read-modify-write at the bytecode level —
+        # without the lock concurrent bumps could be lost.
+        self._gen_lock = threading.Lock()
+        self._speak_generation = 0
 
     def _emit(self, **kw):
         try:
             self.emit(kw)
         except Exception as e:
             log.debug("emit failed: %s", e)
+
+    def _bump_generation(self) -> int:
+        with self._gen_lock:
+            self._speak_generation += 1
+            return self._speak_generation
+
+    def _is_current(self, gen: int) -> bool:
+        with self._gen_lock:
+            return gen == self._speak_generation
 
     def _level_pump(self, recorder):
         """Poll recorder.current_rms and emit ~30 Hz."""
@@ -212,7 +228,7 @@ class VoiceLoop:
 
     def interrupt(self):
         """Barge-in from Swift: stop any active TTS + mark current reply as superseded."""
-        self._speak_generation += 1
+        self._bump_generation()
         try:
             voice_mode.stop_playback()
         except Exception as e:
@@ -224,8 +240,7 @@ class VoiceLoop:
             return
         log.info("process: %r", text[:120])
         # Bump generation first — any in-flight reply from a prior command is abandoned.
-        self._speak_generation += 1
-        gen = self._speak_generation
+        gen = self._bump_generation()
         # Also stop any current playback so the new request starts clean.
         try:
             voice_mode.stop_playback()
@@ -236,7 +251,7 @@ class VoiceLoop:
             try:
                 self._emit(event="state", value="thinking")
                 reply, new_sid = call_hermes_chat(user_text, self._session_id)
-                if my_gen != self._speak_generation:
+                if not self._is_current(my_gen):
                     return
                 if new_sid and new_sid != self._session_id:
                     self._session_id = new_sid
@@ -248,7 +263,7 @@ class VoiceLoop:
                 log.exception("reply worker crashed")
                 self._emit(event="error", message=f"hermes: {e}")
             finally:
-                if my_gen == self._speak_generation:
+                if self._is_current(my_gen):
                     self._emit(event="state", value="listening")
 
         t = threading.Thread(target=_worker, args=(text, gen), daemon=True)
@@ -281,7 +296,7 @@ class VoiceLoop:
             return tts_tool.text_to_speech_tool(reply)
 
         res_json = _do_tts()
-        if my_gen != self._speak_generation:
+        if not self._is_current(my_gen):
             return  # barge-in already happened
 
         res = json.loads(res_json) if isinstance(res_json, str) else res_json
