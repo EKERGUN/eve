@@ -80,7 +80,7 @@ final class SpeechRecognizer: ObservableObject {
                 processedLength = currentText.count
                 lastFinalizedText = currentText
                 awaitingCommandAfterWake = false
-                wakeCutoffIndex = nil
+                wakeCutoffOffset = nil
                 wakeLastText = currentText
                 displayText = ""
                 // Apple's recognizer buffers 1-2s of audio internally, so
@@ -116,7 +116,11 @@ final class SpeechRecognizer: ObservableObject {
 
     // Wake-word state
     private var awaitingCommandAfterWake = false
-    private var wakeCutoffIndex: String.Index? = nil
+    // Offset (Character count from start) into the command transcript marking
+    // where the post-wake command begins. Stored as Int — not String.Index —
+    // because indices from one String value are undefined when applied to a
+    // later, mutated value of `currentText` / `full`.
+    private var wakeCutoffOffset: Int? = nil
     private var lastFinalizedText: String = ""
     /// How many characters of the recognizer's cumulative transcript we've
     /// already analysed for wake words. Bumped to `currentText.count` after
@@ -127,7 +131,7 @@ final class SpeechRecognizer: ObservableObject {
     private var lastWakeAt: Date = .distantPast
     private var lastPartialUpdate: Date = .distantPast
     private var finalizeTimer: Timer?
-    private let silenceFinalizeSeconds: TimeInterval
+    let silenceFinalizeSeconds: TimeInterval
 
     init() {
         let cfg = EVEConfig.load()
@@ -326,7 +330,7 @@ final class SpeechRecognizer: ObservableObject {
             // We cannot map wake-recognizer offset → command-recognizer offset
             // directly (different tokenizations), so we mark "everything from
             // NOW onwards on the command stream is the command".
-            wakeCutoffIndex = currentText.endIndex
+            wakeCutoffOffset = currentText.count
         }
         wakeLastText = full
         // Each wake result counts as an audio update — reset the finalize timer.
@@ -373,7 +377,7 @@ final class SpeechRecognizer: ObservableObject {
             processedLength = 0
             lastFinalizedText = ""
             awaitingCommandAfterWake = false
-            wakeCutoffIndex = nil
+            wakeCutoffOffset = nil
         }
 
         currentText = full
@@ -384,8 +388,8 @@ final class SpeechRecognizer: ObservableObject {
 
         // If we already detected wake via the wake recognizer, keep the
         // cursor at the start of this stream (everything will be the command).
-        if awaitingCommandAfterWake && wakeCutoffIndex == nil {
-            wakeCutoffIndex = full.startIndex
+        if awaitingCommandAfterWake && wakeCutoffOffset == nil {
+            wakeCutoffOffset = 0
         }
 
         // Wake detection only looks at the NEW portion of the transcript
@@ -415,10 +419,10 @@ final class SpeechRecognizer: ObservableObject {
                 onWake?()
             }
             awaitingCommandAfterWake = true
-            // Remember index right AFTER the wake word, in the mixed-case full string.
-            let lowerIdx = lower.index(lower.startIndex, offsetBy: wakeRange.upperBound)
-            let mixedOffset = lower.distance(from: lower.startIndex, to: lowerIdx)
-            wakeCutoffIndex = full.index(full.startIndex, offsetBy: mixedOffset)
+            // `lower` is `full.lowercased()`. For the locales we target (en-US,
+            // tr-TR) lowercasing preserves Character count, so the upperBound
+            // offset in `lower` lines up with the same offset in `full`.
+            wakeCutoffOffset = min(wakeRange.upperBound, full.count)
         }
 
         // Every partial update resets the finalize timer. When it fires after
@@ -456,16 +460,20 @@ final class SpeechRecognizer: ObservableObject {
         if awaitingCommandAfterWake {
             // Find the LAST wake match in the *current* full text and take
             // everything after it. Apple's recognizer occasionally re-writes
-            // partials without changing length, so a stored index can go
+            // partials without changing length, so a stored offset can go
             // stale; rescanning at finalize avoids losing command words.
             let lower = full.lowercased()
             if let endOffset = findLastWakeEnd(in: lower) {
-                let idx = full.index(full.startIndex, offsetBy: endOffset)
+                let safe = max(0, min(endOffset, full.count))
+                let idx = full.index(full.startIndex, offsetBy: safe)
                 command = String(full[idx...])
                     .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
-            } else if let cut = wakeCutoffIndex, cut <= full.endIndex {
-                // Rescan didn't find the wake (rare) — fall back to stored index.
-                command = String(full[cut...])
+            } else if let cut = wakeCutoffOffset {
+                // Rescan didn't find the wake (rare) — fall back to stored
+                // offset, clamped in case the transcript shrunk since we set it.
+                let safe = max(0, min(cut, full.count))
+                let idx = full.index(full.startIndex, offsetBy: safe)
+                command = String(full[idx...])
                     .trimmingCharacters(in: CharacterSet(charactersIn: " ,.!?;:\n\t"))
             }
         } else if conversationActive {
@@ -491,7 +499,7 @@ final class SpeechRecognizer: ObservableObject {
 
         processedLength = full.count
         awaitingCommandAfterWake = false
-        wakeCutoffIndex = nil
+        wakeCutoffOffset = nil
         lastFinalizedText = full
         wakeLastText = full
         displayText = ""

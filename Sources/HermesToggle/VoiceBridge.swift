@@ -128,11 +128,33 @@ final class VoiceBridge: ObservableObject {
 
     private func freePort() {
         // Kill anything holding the bridge port (zombie from a prior session).
+        // We invoke lsof + pkill directly via Process (no /bin/sh) so an
+        // attacker-controlled `port` value can't break out of the argument list.
+        let pids = pidsHoldingPort(port)
+        for pid in pids {
+            kill(pid, SIGKILL)
+        }
+        let pkill = Process()
+        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        pkill.arguments = ["-9", "-f", "voice-bridge/bridge.py"]
+        pkill.standardOutput = FileHandle.nullDevice
+        pkill.standardError = FileHandle.nullDevice
+        try? pkill.run()
+        pkill.waitUntilExit()
+    }
+
+    private func pidsHoldingPort(_ port: Int) -> [pid_t] {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "lsof -nP -tiTCP:\(port) | xargs -r kill -9 2>/dev/null; pkill -9 -f 'voice-bridge/bridge.py' 2>/dev/null; true"]
-        try? p.run()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        p.arguments = ["-nP", "-tiTCP:\(port)"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        guard let s = String(data: data, encoding: .utf8) else { return [] }
+        return s.split(whereSeparator: { $0.isWhitespace }).compactMap { pid_t($0) }
     }
 
     private func spawnBridge() throws {
@@ -146,7 +168,10 @@ final class VoiceBridge: ObservableObject {
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonPath)
-        proc.arguments = [bridgeScriptPath, "--port", "\(port)", "--silence-duration", "1.5"]
+        // Forward the user-configured silence-finalize value so the bridge's
+        // own timer can't out-race Swift's. Mirrors EVEConfig.silence_finalize_seconds.
+        let silence = String(format: "%.2f", speech.silenceFinalizeSeconds)
+        proc.arguments = [bridgeScriptPath, "--port", "\(port)", "--silence-duration", silence]
 
         var env = ProcessInfo.processInfo.environment
         env["HERMES_HOME"] = "\(NSHomeDirectory())/.hermes"
