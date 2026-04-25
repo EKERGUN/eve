@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Speech
+import WakeMatcher
 
 /// Simple file logger at ~/Library/Logs/HermesToggle/swift.log — NSLog is
 /// unreliable for ad-hoc signed apps, so we append to a file we control.
@@ -100,6 +101,7 @@ final class SpeechRecognizer: ObservableObject {
     private let config: EVEConfig
     private let wakeWords: [String]
     private let stopPhraseSet: Set<String>
+    private let matcher: WakeMatcher
 
     // Callbacks
     var onCommand: ((String) -> Void)?   // final command text (post-wake)
@@ -137,10 +139,11 @@ final class SpeechRecognizer: ObservableObject {
     init() {
         let cfg = EVEConfig.load()
         self.config = cfg
-        self.wakeWords = (cfg.wake_words?.isEmpty == false ? cfg.wake_words! : EVEConfig.defaultWakeWords)
-            .map { $0.lowercased() }
-        self.stopPhraseSet = Set((cfg.stop_phrases?.isEmpty == false ? cfg.stop_phrases! : EVEConfig.defaultStopPhrases)
-            .map { $0.lowercased() })
+        let rawWakes = (cfg.wake_words?.isEmpty == false ? cfg.wake_words! : EVEConfig.defaultWakeWords)
+        let rawStops = (cfg.stop_phrases?.isEmpty == false ? cfg.stop_phrases! : EVEConfig.defaultStopPhrases)
+        self.wakeWords = rawWakes.map { $0.lowercased() }
+        self.stopPhraseSet = Set(rawStops.map { $0.lowercased() })
+        self.matcher = WakeMatcher(wakeWords: rawWakes, stopPhrases: rawStops)
         self.silenceFinalizeSeconds = cfg.silence_finalize_seconds ?? 1.2
         let locale = cfg.locale ?? "en-US"
         self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale))
@@ -342,7 +345,7 @@ final class SpeechRecognizer: ObservableObject {
         }
         let lower = full.lowercased()
         // Only look at the tail (everything past what we already processed).
-        if let _ = findWake(in: lower, after: wakeLastText.lowercased().count) {
+        if let _ = matcher.findWake(in: lower, after: wakeLastText.lowercased().count) {
             let now = Date()
             if now.timeIntervalSince(lastWakeAt) > 0.6 {
                 lastWakeAt = now
@@ -426,7 +429,7 @@ final class SpeechRecognizer: ObservableObject {
             // emergency barge-in pattern ("<wake> <stop>") — a sequence
             // that essentially never appears in Hermes's own reply text.
             let newTail = String(full.dropFirst(processedLength))
-            if let _ = matchWakeThenStop(in: newTail) {
+            if let _ = matcher.matchWakeThenStop(in: newTail) {
                 FileLog.log("[speech] barge-in STOP during \(suppressWake ? "suppression" : "drain"): \(newTail.suffix(80))")
                 conversationActive = false
                 onStop?()
@@ -435,7 +438,7 @@ final class SpeechRecognizer: ObservableObject {
             lastFinalizedText = full
             return
         }
-        if let wakeRange = findWake(in: lower, after: max(processedLength, lastFinalizedText.lowercased().count)) {
+        if let wakeRange = matcher.findWake(in: lower, after: max(processedLength, lastFinalizedText.lowercased().count)) {
             // Fire wake event immediately (barge-in).
             let now = Date()
             if now.timeIntervalSince(lastWakeAt) > 0.6 {
@@ -487,7 +490,7 @@ final class SpeechRecognizer: ObservableObject {
             // partials without changing length, so a stored offset can go
             // stale; rescanning at finalize avoids losing command words.
             let lower = full.lowercased()
-            if let endOffset = findLastWakeEnd(in: lower) {
+            if let endOffset = matcher.findLastWakeEnd(in: lower) {
                 let safe = max(0, min(endOffset, full.count))
                 let idx = full.index(full.startIndex, offsetBy: safe)
                 command = String(full[idx...])
@@ -509,7 +512,7 @@ final class SpeechRecognizer: ObservableObject {
         }
 
         if let c = command, !c.isEmpty {
-            if isStopPhrase(c) {
+            if matcher.isStopPhrase(c) {
                 FileLog.log("[speech] stop phrase: \(c) — exiting conversation")
                 conversationActive = false
                 onStop?()
@@ -527,34 +530,6 @@ final class SpeechRecognizer: ObservableObject {
         lastFinalizedText = full
         wakeLastText = full
         displayText = ""
-    }
-
-    func isStopPhrase(_ text: String) -> Bool {
-        let cleaned = text.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
-        if stopPhraseSet.contains(cleaned) { return true }
-
-        // Split into words. If every word (after dedup) forms a stop phrase,
-        // treat the whole utterance as "stop". Catches "stop stop", "stop now",
-        // "be quiet be quiet", etc.
-        let words = cleaned
-            .split(whereSeparator: { !$0.isLetter })
-            .map { String($0) }
-            .filter { !$0.isEmpty }
-        guard !words.isEmpty else { return false }
-
-        // De-dupe adjacent repeats: "stop stop stop" -> "stop"
-        var compact: [String] = []
-        for w in words where compact.last != w { compact.append(w) }
-        let collapsed = compact.joined(separator: " ")
-        if stopPhraseSet.contains(collapsed) { return true }
-
-        // Also accept if EVERY distinct word is a single-word stop token.
-        let singleWordStops = Set(stopPhraseSet.filter { !$0.contains(" ") })
-        if Set(words).isSubset(of: singleWordStops) { return true }
-
-        return false
     }
 
     private func startNewRequest() {
@@ -589,64 +564,4 @@ final class SpeechRecognizer: ObservableObject {
         }
     }
 
-    /// Check if the input contains a wake word followed immediately (within a
-    /// few filler tokens) by a stop phrase — e.g. "eve stop", "eve be quiet",
-    /// "hey eve shut up". Used for barge-in during TTS playback.
-    func matchWakeThenStop(in text: String) -> Range<String.Index>? {
-        let lower = text.lowercased()
-        for wake in wakeWords.sorted(by: { $0.count > $1.count }) {
-            let wakeEsc = NSRegularExpression.escapedPattern(for: wake)
-            for stop in stopPhraseSet {
-                let stopEsc = NSRegularExpression.escapedPattern(for: stop)
-                let pattern = "\\b\(wakeEsc)\\b[,\\.!\\?\\s]*\\b\(stopEsc)\\b"
-                if let r = lower.range(of: pattern, options: [.regularExpression]) {
-                    return r
-                }
-            }
-        }
-        return nil
-    }
-
-    /// Scan the ENTIRE string for the LAST occurrence of any wake word and
-    /// return the offset just past its end. Used on finalize to locate the
-    /// command boundary fresh (avoids stale indices when Apple re-transcribes
-    /// partials).
-    func findLastWakeEnd(in lower: String) -> Int? {
-        let sorted = wakeWords.sorted { $0.count > $1.count }
-        var best: Int? = nil
-        var bestStart: Int = -1
-        for v in sorted {
-            let escaped = NSRegularExpression.escapedPattern(for: v)
-            let regex = try? NSRegularExpression(pattern: "\\b\(escaped)\\b",
-                                                 options: .caseInsensitive)
-            guard let rx = regex else { continue }
-            let ns = lower as NSString
-            let matches = rx.matches(in: lower, range: NSRange(location: 0, length: ns.length))
-            for m in matches {
-                if m.range.location > bestStart {
-                    bestStart = m.range.location
-                    best = m.range.location + m.range.length
-                }
-            }
-        }
-        return best
-    }
-
-    // Wake-word matcher. Uses the per-instance `wakeWords` list (config-driven).
-    // Returns the (start, end) offset range in `lower`, or nil. Longer variants
-    // checked first so "hey eve" beats "eve".
-    func findWake(in lower: String, after startOffset: Int) -> Range<Int>? {
-        let sorted = wakeWords.sorted { $0.count > $1.count }
-        let search = String(lower.dropFirst(min(startOffset, lower.count)))
-        for v in sorted {
-            let escaped = NSRegularExpression.escapedPattern(for: v)
-            if let r = search.range(of: "\\b\(escaped)\\b",
-                                    options: [.regularExpression, .caseInsensitive]) {
-                let offset = search.distance(from: search.startIndex, to: r.lowerBound) + startOffset
-                let end = search.distance(from: search.startIndex, to: r.upperBound) + startOffset
-                return offset..<end
-            }
-        }
-        return nil
-    }
 }
