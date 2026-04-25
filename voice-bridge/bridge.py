@@ -47,32 +47,9 @@ HERMES_BIN_CANDIDATES = [
 # (Edge) run locally; the reply comes from `hermes chat`.
 WHISPER_MODEL = os.environ.get("HERMES_VOICE_WHISPER", "small")
 HERMES_CHAT_TIMEOUT = int(os.environ.get("HERMES_VOICE_TIMEOUT", "180"))
-WAKE_WORD = os.environ.get("HERMES_WAKE_WORD", "eve").lower()
 
 # Turkish letters used to pick the TTS voice
 _TR_CHARS = set("çğıöşüÇĞİÖŞÜ")
-
-# Accept "eve", "eve,", "hey eve", "hey eve,", etc. Case-insensitive.
-# Whisper sometimes transcribes as "Eva", "Ave", "Evie", or Turkish "Ev" —
-# include a small set of near-matches to improve recall.
-_WAKE_VARIANTS = {"eve", "eva", "evie", "evy", "ev", "hev", "have", "hev.", "eva.", "eve.", "ave"}
-_WAKE_PATTERN = re.compile(
-    r"\b(eve|eva|evie|evy|ev|hev|have|ave)\b[,\.\!\?:;\s]*",
-    re.IGNORECASE,
-)
-
-
-def detect_wake(text: str) -> Optional[str]:
-    """If transcript contains the wake word, return text AFTER it (stripped).
-    Else return None. The substring *before* the wake word is discarded.
-    """
-    if not text:
-        return None
-    m = _WAKE_PATTERN.search(text)
-    if not m:
-        return None
-    post = text[m.end():].strip(" ,.!?;:")
-    return post  # may be empty string (pure wake trigger, no command yet)
 
 def _ensure_hermes_agent_layout() -> None:
     """Verify the configured Hermes Agent path exists and looks valid before

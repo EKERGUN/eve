@@ -47,15 +47,57 @@ struct EVEConfig: Codable {
         "dur", "sus", "kes", "kes sesini", "sessiz ol", "yeter", "tamam dur",
     ]
 
+    static let knownKeys: Set<String> = [
+        "wake_words", "stop_phrases", "locale", "wake_locale",
+        "silence_finalize_seconds",
+    ]
+
     static func load() -> EVEConfig {
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/EVE/config.json")
-        guard let data = try? Data(contentsOf: url),
-              let cfg = try? JSONDecoder().decode(EVEConfig.self, from: data) else {
+        guard let data = try? Data(contentsOf: url) else {
+            return EVEConfig()
+        }
+        // Decode twice: once as a generic dict to surface unknown keys (Codable
+        // silently drops them), once as the typed struct.
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let unknown = Set(raw.keys).subtracting(knownKeys)
+            if !unknown.isEmpty {
+                FileLog.log("[speech] config WARNING: unknown keys ignored: \(unknown.sorted())")
+            }
+        }
+        guard let cfg = try? JSONDecoder().decode(EVEConfig.self, from: data) else {
+            FileLog.log("[speech] config WARNING: parse failed, using defaults")
             return EVEConfig()
         }
         FileLog.log("[speech] loaded config: \(url.path)")
+        cfg.warnAboutInvalidValues()
         return cfg
+    }
+
+    /// Logs a warning for any field whose value is structurally valid JSON
+    /// but semantically nonsensical (empty wake list, absurd silence
+    /// duration, malformed locale). Non-fatal — defaults still apply.
+    func warnAboutInvalidValues() {
+        if let wakes = wake_words, wakes.isEmpty {
+            FileLog.log("[speech] config WARNING: wake_words is empty — falling back to defaults")
+        }
+        if let stops = stop_phrases, stops.isEmpty {
+            FileLog.log("[speech] config WARNING: stop_phrases is empty — falling back to defaults")
+        }
+        if let s = silence_finalize_seconds, !(0.3...10.0).contains(s) {
+            FileLog.log("[speech] config WARNING: silence_finalize_seconds=\(s) outside [0.3, 10.0] — recognizer may misbehave")
+        }
+        for (name, value) in [("locale", locale), ("wake_locale", wake_locale)] {
+            guard let v = value else { continue }
+            // Locale identifiers look like "xx" or "xx-YY" / "xx_YY". Anything
+            // else is almost certainly a typo (e.g. "english" instead of "en-US").
+            let valid = v.range(of: "^[a-z]{2,3}([-_][A-Za-z0-9]{2,8})?$",
+                                options: .regularExpression) != nil
+            if !valid {
+                FileLog.log("[speech] config WARNING: \(name)=\"\(v)\" doesn't look like a BCP-47 locale (e.g. \"en-US\")")
+            }
+        }
     }
 }
 
